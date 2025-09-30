@@ -1,5 +1,5 @@
 {
-  "name": "evalite",
+  "name": "@quuu/evalite",
   "version": "0.11.5",
   "type": "module",
   "description": "Test your LLM-powered apps with a TypeScript-native, Vitest-based eval runner. No API key required.",

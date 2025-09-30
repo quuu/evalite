@@ -152,6 +152,56 @@ export declare namespace Evalite {
     path: string;
   };
 
+  export type ExportedResultData = {
+    input: unknown;
+    output: unknown;
+    expected?: unknown;
+    scores: Score[];
+    duration: number;
+    traces: Trace[];
+    renderedColumns: RenderedColumn[];
+    status: ResultStatus;
+  };
+
+  export type ExportedResults = {
+    evalName: string;
+    results: ExportedResultData[];
+    averageScore: number;
+    duration: number;
+    status: ResultStatus;
+  };
+
+  export type ExportedSummary = {
+    evalName: string;
+    totalResults: number;
+    passedResults: number;
+    failedResults: number;
+    averageScore: number;
+    averageScoreByScorer: Record<string, number>;
+    totalDuration: number;
+    status: ResultStatus;
+  };
+
+  export type EvaliteHandle = {
+    /**
+     * Register a callback to be invoked each time a result completes.
+     * Useful for streaming results as they become available.
+     */
+    onResult: (callback: (result: ExportedResultData) => void) => void;
+
+    /**
+     * Get all results after the evaluation completes.
+     * Returns a promise that resolves when all tests finish.
+     */
+    getResults: () => Promise<ExportedResults>;
+
+    /**
+     * Get an aggregated summary after the evaluation completes.
+     * Returns a promise that resolves when all tests finish.
+     */
+    getSummary: () => Promise<ExportedSummary>;
+  };
+
   export namespace SDK {
     export type GetEvalByNameResult = {
       history: {

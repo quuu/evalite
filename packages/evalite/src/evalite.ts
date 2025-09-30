@@ -7,6 +7,7 @@ import { createEvaliteFileIfNeeded } from "./utils.js";
 import type { Evalite } from "./types.js";
 import { FILES_LOCATION } from "./backend-only-constants.js";
 import { createScorer } from "./index.js";
+import { average } from "./utils.js";
 
 declare module "vitest" {
   interface TaskMeta {
@@ -101,24 +102,79 @@ const runTask = async <TInput, TOutput, TExpected>(
 export const evalite = <TInput, TOutput, TExpected = TOutput>(
   evalName: string,
   opts: Evalite.RunnerOpts<TInput, TOutput, TExpected>
-) => registerEvalite(evalName, opts);
+): Evalite.EvaliteHandle => registerEvalite(evalName, opts);
 
 evalite.experimental_skip = <TInput, TOutput, TExpected>(
   evalName: string,
   opts: Evalite.RunnerOpts<TInput, TOutput, TExpected>
-) => registerEvalite(evalName, opts, { modifier: "skip" });
+): Evalite.EvaliteHandle =>
+  registerEvalite(evalName, opts, { modifier: "skip" });
 
 function registerEvalite<TInput, TOutput, TExpected>(
   evalName: string,
   opts: Evalite.RunnerOpts<TInput, TOutput, TExpected>,
   vitestOpts: { modifier?: "only" | "skip" } = {}
-) {
+): Evalite.EvaliteHandle {
   const describeFn = vitestOpts.modifier === "skip" ? describe.skip : describe;
   const datasetPromise =
     vitestOpts.modifier === "skip" ? Promise.resolve([]) : opts.data();
 
-  return describeFn(evalName, async () => {
+  // State to track results
+  const completedResults: Evalite.ExportedResultData[] = [];
+  const resultCallbacks: Array<(result: Evalite.ExportedResultData) => void> =
+    [];
+  let completionPromise: Promise<void>;
+  let resolveCompletion: () => void;
+  let totalTests = 0;
+
+  // Create completion promise upfront
+  completionPromise = new Promise((resolve) => {
+    resolveCompletion = resolve;
+  });
+
+  // Helper to check if all results are complete
+  const checkCompletion = () => {
+    if (totalTests > 0 && completedResults.length === totalTests) {
+      resolveCompletion();
+    }
+  };
+
+  // Register result
+  const registerResult = (result: Evalite.Result) => {
+    const exportedResult: Evalite.ExportedResultData = {
+      input: result.input,
+      output: result.output,
+      expected: result.expected,
+      scores: result.scores,
+      duration: result.duration,
+      traces: result.traces,
+      renderedColumns: result.renderedColumns,
+      status: result.status,
+    };
+
+    completedResults.push(exportedResult);
+
+    // Notify callbacks
+    resultCallbacks.forEach((callback) => {
+      try {
+        callback(exportedResult);
+      } catch (e) {
+        console.error("Error in onResult callback:", e);
+      }
+    });
+
+    checkCompletion();
+  };
+
+  describeFn(evalName, async () => {
     const dataset = await datasetPromise;
+    totalTests = dataset.length;
+
+    // If no tests, complete immediately
+    if (totalTests === 0) {
+      resolveCompletion();
+    }
+
     it.concurrent.for(dataset.map((d, index) => ({ ...d, index })))(
       evalName,
       async (data, { task }) => {
@@ -185,39 +241,49 @@ function registerEvalite<TInput, TOutput, TExpected>(
               handleFilesInColumns(rootDir, columns),
             ]);
 
+          const result = {
+            evalName: evalName,
+            filepath: task.file.filepath,
+            order: data.index,
+            duration,
+            expected: expected,
+            input: input,
+            output: outputWithFiles,
+            scores,
+            traces: tracesWithFiles,
+            status: "success" as const,
+            renderedColumns,
+          };
+
           task.meta.evalite = {
-            result: {
-              evalName: evalName,
-              filepath: task.file.filepath,
-              order: data.index,
-              duration,
-              expected: expected,
-              input: input,
-              output: outputWithFiles,
-              scores,
-              traces: tracesWithFiles,
-              status: "success",
-              renderedColumns,
-            },
+            result,
             duration: Math.round(performance.now() - start),
           };
+
+          // Register result for export API
+          registerResult(result);
         } catch (e) {
+          const result = {
+            evalName: evalName,
+            filepath: task.file.filepath,
+            order: data.index,
+            duration: Math.round(performance.now() - start),
+            expected: expected,
+            input: input,
+            output: e,
+            scores: [],
+            traces: await handleFilesInTraces(rootDir, traces),
+            status: "fail" as const,
+            renderedColumns: [],
+          };
+
           task.meta.evalite = {
-            result: {
-              evalName: evalName,
-              filepath: task.file.filepath,
-              order: data.index,
-              duration: Math.round(performance.now() - start),
-              expected: expected,
-              input: input,
-              output: e,
-              scores: [],
-              traces: await handleFilesInTraces(rootDir, traces),
-              status: "fail",
-              renderedColumns: [],
-            },
+            result,
             duration: Math.round(performance.now() - start),
           };
+
+          // Register result for export API
+          registerResult(result);
           throw e;
         }
 
@@ -225,6 +291,82 @@ function registerEvalite<TInput, TOutput, TExpected>(
       }
     );
   });
+
+  // Return the handle with export API
+  return {
+    onResult: (callback: (result: Evalite.ExportedResultData) => void) => {
+      resultCallbacks.push(callback);
+    },
+
+    getResults: async (): Promise<Evalite.ExportedResults> => {
+      await completionPromise;
+
+      const allScores = completedResults.flatMap((r) => r.scores);
+      const averageScore = average(allScores, (s) => s.score ?? 0);
+      const totalDuration = Math.max(
+        ...completedResults.map((r) => r.duration),
+        0
+      );
+      const status = completedResults.some((r) => r.status === "fail")
+        ? ("fail" as const)
+        : ("success" as const);
+
+      return {
+        evalName,
+        results: completedResults,
+        averageScore,
+        duration: totalDuration,
+        status,
+      };
+    },
+
+    getSummary: async (): Promise<Evalite.ExportedSummary> => {
+      await completionPromise;
+
+      const allScores = completedResults.flatMap((r) => r.scores);
+      const averageScore = average(allScores, (s) => s.score ?? 0);
+
+      // Calculate average by scorer
+      const scoresByScorer: Record<string, number[]> = {};
+      for (const result of completedResults) {
+        for (const score of result.scores) {
+          if (!scoresByScorer[score.name]) {
+            scoresByScorer[score.name] = [];
+          }
+          scoresByScorer[score.name]?.push(score.score ?? 0);
+        }
+      }
+
+      const averageScoreByScorer: Record<string, number> = {};
+      for (const [scorerName, scores] of Object.entries(scoresByScorer)) {
+        averageScoreByScorer[scorerName] = average(scores, (s) => s);
+      }
+
+      const totalDuration = completedResults.reduce(
+        (sum, r) => sum + r.duration,
+        0
+      );
+      const passedResults = completedResults.filter(
+        (r) => r.status === "success"
+      ).length;
+      const failedResults = completedResults.filter(
+        (r) => r.status === "fail"
+      ).length;
+      const status =
+        failedResults > 0 ? ("fail" as const) : ("success" as const);
+
+      return {
+        evalName,
+        totalResults: completedResults.length,
+        passedResults,
+        failedResults,
+        averageScore,
+        averageScoreByScorer,
+        totalDuration,
+        status,
+      };
+    },
+  };
 }
 
 const handleFilesInColumns = async (
